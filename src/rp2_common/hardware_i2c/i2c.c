@@ -132,7 +132,7 @@ void i2c_set_slave_mode(i2c_inst_t *i2c, bool slave, uint8_t addr) {
     i2c->hw->enable = 1;
 }
 
-static int i2c_write_blocking_internal(i2c_inst_t *i2c, uint8_t addr, const uint8_t *src, size_t len, bool nostop,
+static int i2c_write_blocking_internal(i2c_inst_t *i2c, uint8_t addr, const uint8_t *src, size_t len, bool nostop, bool nostart,
                                        check_timeout_fn timeout_check, struct timeout_state *ts) {
     invalid_params_if(I2C, addr >= 0x80); // 7-bit addresses
     invalid_params_if(I2C, i2c_reserved_addr(addr));
@@ -235,29 +235,106 @@ static int i2c_write_blocking_internal(i2c_inst_t *i2c, uint8_t addr, const uint
         rval = byte_ctr;
     }
 
-    // nostop means we are now at the end of a *message* but not the end of a *transfer*
-    //i2c->restart_on_next = nostop;
+    
+    // nostop means we are now at the end of the transmission but not releasing the bus. 
+    // nostart means we will not send a restart. 
+    // we can just continue to clock bytes e.g. continuous read of MCP23017
+
+    if (!nostart) {
+        i2c->restart_on_next = nostop;
+    }
     return rval;
 }
 
-int i2c_write_blocking(i2c_inst_t *i2c, uint8_t addr, const uint8_t *src, size_t len, bool nostop) {
-    return i2c_write_blocking_internal(i2c, addr, src, len, nostop, NULL, NULL);
+int i2c_write_non_blocking(i2c_inst_t *i2c, uint8_t addr, const uint8_t *src, size_t len, bool nostop, bool nostart) {
+    invalid_params_if(I2C, addr >= 0x80); // 7-bit addresses
+    invalid_params_if(I2C, i2c_reserved_addr(addr));
+    // Synopsys hw accepts start/stop flags alongside data items in the same
+    // FIFO word, so no 0 byte transfers.
+    invalid_params_if(I2C, len == 0);
+    invalid_params_if(I2C, ((int)len) < 0);
+
+    i2c->hw->enable = 0;
+    i2c->hw->tar = addr;
+    i2c->hw->enable = 1;
+
+    bool abort = false;
+
+    uint32_t abort_reason = 0;
+    int byte_ctr;
+
+    int ilen = (int)len;
+    for (byte_ctr = 0; byte_ctr < ilen; ++byte_ctr) {
+        bool first = byte_ctr == 0;
+        bool last = byte_ctr == ilen - 1;
+
+        abort_reason = i2c->hw->tx_abrt_source;
+        if (abort_reason) {
+            // Note clearing the abort flag also clears the reason, and
+            // this instance of flag is clear-on-read! Note also the
+            // IC_CLR_TX_ABRT register always reads as 0.
+            i2c->hw->clr_tx_abrt;
+            abort = true;
+        }
+        // Note the hardware issues a STOP automatically on an abort condition.
+        // Note also the hardware clears RX FIFO as well as TX on abort,
+        // because we set hwparam IC_AVOID_RX_FIFO_FLUSH_ON_TX_ABRT to 0.
+        if (abort)
+            break;
+        
+        i2c->hw->data_cmd =
+                bool_to_bit(first && i2c->restart_on_next) << I2C_IC_DATA_CMD_RESTART_LSB |
+                bool_to_bit(last && !nostop) << I2C_IC_DATA_CMD_STOP_LSB |
+                *src++;
+    }
+
+    int rval;
+    // A lot of things could have just happened due to the ingenious and
+    // creative design of I2C. Try to figure things out.
+    if (abort) {
+        if (!abort_reason || abort_reason & I2C_IC_TX_ABRT_SOURCE_ABRT_7B_ADDR_NOACK_BITS) {
+            // No reported errors - seems to happen if there is nothing connected to the bus.
+            // Address byte not acknowledged
+            rval = PICO_ERROR_GENERIC;
+        } else if (abort_reason & I2C_IC_TX_ABRT_SOURCE_ABRT_TXDATA_NOACK_BITS) {
+            // Address acknowledged, some data not acknowledged
+            rval = byte_ctr;
+        } else {
+            //panic("Unknown abort from I2C instance @%08x: %08x\n", (uint32_t) i2c->hw, abort_reason);
+            rval = PICO_ERROR_GENERIC;
+        }
+    } else {
+        rval = byte_ctr;
+    }
+
+    // nostop means we are now at the end of the transmission but not releasing the bus. 
+    // nostart means we will not send a restart. 
+    // we can just continue to clock bytes e.g. continuous read of MCP23017
+
+    if (!nostart) {
+        i2c->restart_on_next = nostop;
+    }
+    return rval;
 }
 
-int i2c_write_blocking_until(i2c_inst_t *i2c, uint8_t addr, const uint8_t *src, size_t len, bool nostop,
+int i2c_write_blocking(i2c_inst_t *i2c, uint8_t addr, const uint8_t *src, size_t len, bool nostop, bool nostart) {
+    return i2c_write_blocking_internal(i2c, addr, src, len, nostop, nostart, NULL, NULL);
+}
+
+int i2c_write_blocking_until(i2c_inst_t *i2c, uint8_t addr, const uint8_t *src, size_t len, bool nostop, bool nostart,
                              absolute_time_t until) {
     timeout_state_t ts;
-    return i2c_write_blocking_internal(i2c, addr, src, len, nostop, init_single_timeout_until(&ts, until), &ts);
+    return i2c_write_blocking_internal(i2c, addr, src, len, nostop, nostart, init_single_timeout_until(&ts, until), &ts);
 }
 
-int i2c_write_timeout_per_char_us(i2c_inst_t *i2c, uint8_t addr, const uint8_t *src, size_t len, bool nostop,
+int i2c_write_timeout_per_char_us(i2c_inst_t *i2c, uint8_t addr, const uint8_t *src, size_t len, bool nostop, bool nostart,
                                   uint timeout_per_char_us) {
     timeout_state_t ts;
-    return i2c_write_blocking_internal(i2c, addr, src, len, nostop,
+    return i2c_write_blocking_internal(i2c, addr, src, len, nostop, nostart,
                                        init_per_iteration_timeout_us(&ts, timeout_per_char_us), &ts);
 }
 
-static int i2c_read_blocking_internal(i2c_inst_t *i2c, uint8_t addr, uint8_t *dst, size_t len, bool nostop,
+static int i2c_read_blocking_internal(i2c_inst_t *i2c, uint8_t addr, uint8_t *dst, size_t len, bool nostop, bool nostart,
                                check_timeout_fn timeout_check, timeout_state_t *ts) {
     invalid_params_if(I2C, addr >= 0x80); // 7-bit addresses
     invalid_params_if(I2C, i2c_reserved_addr(addr));
@@ -316,22 +393,27 @@ static int i2c_read_blocking_internal(i2c_inst_t *i2c, uint8_t addr, uint8_t *ds
         rval = byte_ctr;
     }
 
-    //i2c->restart_on_next = nostop;
+    // nostop means we are now at the end of the transmission but not releasing the bus. 
+    // nostart means we will not send a restart. 
+    // we can just continue to clock bytes e.g. continuous read of MCP23017
+    if (!nostart) {
+        i2c->restart_on_next = nostop;
+    }
     return rval;
 }
 
-int i2c_read_blocking(i2c_inst_t *i2c, uint8_t addr, uint8_t *dst, size_t len, bool nostop) {
-    return i2c_read_blocking_internal(i2c, addr, dst, len, nostop, NULL, NULL);
+int i2c_read_blocking(i2c_inst_t *i2c, uint8_t addr, uint8_t *dst, size_t len, bool nostop, bool nostart) {
+    return i2c_read_blocking_internal(i2c, addr, dst, len, nostop, nostart, NULL, NULL);
 }
 
-int i2c_read_blocking_until(i2c_inst_t *i2c, uint8_t addr, uint8_t *dst, size_t len, bool nostop, absolute_time_t until) {
+int i2c_read_blocking_until(i2c_inst_t *i2c, uint8_t addr, uint8_t *dst, size_t len, bool nostop, bool nostart, absolute_time_t until) {
     timeout_state_t ts;
-    return i2c_read_blocking_internal(i2c, addr, dst, len, nostop, init_single_timeout_until(&ts, until), &ts);
+    return i2c_read_blocking_internal(i2c, addr, dst, len, nostop, nostart, init_single_timeout_until(&ts, until), &ts);
 }
 
-int i2c_read_timeout_per_char_us(i2c_inst_t *i2c, uint8_t addr, uint8_t *dst, size_t len, bool nostop,
+int i2c_read_timeout_per_char_us(i2c_inst_t *i2c, uint8_t addr, uint8_t *dst, size_t len, bool nostop, bool nostart,
                                  uint timeout_per_char_us) {
     timeout_state_t ts;
-    return i2c_read_blocking_internal(i2c, addr, dst, len, nostop,
+    return i2c_read_blocking_internal(i2c, addr, dst, len, nostop, nostart,
                                       init_per_iteration_timeout_us(&ts, timeout_per_char_us), &ts);
 }
