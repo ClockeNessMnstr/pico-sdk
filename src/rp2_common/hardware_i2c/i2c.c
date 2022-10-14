@@ -239,10 +239,7 @@ static int i2c_write_blocking_internal(i2c_inst_t *i2c, uint8_t addr, const uint
     // nostop means we are now at the end of the transmission but not releasing the bus. 
     // nostart means we will not send a restart. 
     // we can just continue to clock bytes e.g. continuous read of MCP23017
-
-    if (!nostart) {
-        i2c->restart_on_next = nostop;
-    }
+    i2c->restart_on_next = nostop && !nostart;
     return rval;
 }
 
@@ -310,10 +307,7 @@ int i2c_write_non_blocking(i2c_inst_t *i2c, uint8_t addr, const uint8_t *src, si
     // nostop means we are now at the end of the transmission but not releasing the bus. 
     // nostart means we will not send a restart. 
     // we can just continue to clock bytes e.g. continuous read of MCP23017
-
-    if (!nostart) {
-        i2c->restart_on_next = nostop;
-    }
+    i2c->restart_on_next = nostop && !nostart;
     return rval;
 }
 
@@ -396,9 +390,7 @@ static int i2c_read_blocking_internal(i2c_inst_t *i2c, uint8_t addr, uint8_t *ds
     // nostop means we are now at the end of the transmission but not releasing the bus. 
     // nostart means we will not send a restart. 
     // we can just continue to clock bytes e.g. continuous read of MCP23017
-    if (!nostart) {
-        i2c->restart_on_next = nostop;
-    }
+    i2c->restart_on_next = nostop && !nostart;
     return rval;
 }
 
